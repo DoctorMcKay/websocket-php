@@ -19,8 +19,10 @@ class Base implements LoggerAwareInterface
     protected $is_closing = false;
     protected $last_opcode = null;
     protected $close_status = null;
+    protected $close_status_string = null;
     protected $logger;
     private $read_buffer;
+    private $nonblocking_read_buffer = '';
 
     protected static $opcodes = [
         'continuation' => 0,
@@ -39,6 +41,11 @@ class Base implements LoggerAwareInterface
     public function getCloseStatus(): ?int
     {
         return $this->close_status;
+    }
+
+    public function getCloseStatusString(): ?string
+    {
+    	return $this->close_status_string;
     }
 
     public function isConnected(): bool
@@ -231,35 +238,37 @@ class Base implements LoggerAwareInterface
             $this->connect();
         }
 
-        do {
-            $response = $this->receiveFragment();
-            list ($payload, $final, $opcode) = $response;
+        if (!($response = $this->receiveFragment())) {
+            return null;
+        }
+        list ($payload, $final, $opcode) = $response;
 
-            // Continuation and factual opcode
-            $continuation = ($opcode == 'continuation');
-            $payload_opcode = $continuation ? $this->read_buffer['opcode'] : $opcode;
+        // Continuation and factual opcode
+        $continuation = ($opcode == 'continuation');
+        $payload_opcode = $continuation ? $this->read_buffer['opcode'] : $opcode;
 
-            // Filter frames
-            if (!in_array($payload_opcode, $filter)) {
-                if ($payload_opcode == 'close') {
-                    return null; // Always abort receive on close
-                }
-                $final = false;
-                continue; // Continue reading
-            }
+        // Filter frames
+        if (!in_array($payload_opcode, $filter)) {
+            return null;
+        }
 
-            // First continuation frame, create buffer
-            if (!$final && !$continuation) {
-                $this->read_buffer = ['opcode' => $opcode, 'payload' => $payload, 'frames' => 1];
-                continue; // Continue reading
-            }
+        // First continuation frame, create buffer
+        if (!$final && !$continuation) {
+            $this->read_buffer = ['opcode' => $opcode, 'payload' => $payload, 'frames' => 1];
+            return null; // Continue reading
+        }
 
-            // Subsequent continuation frames, add to buffer
-            if ($continuation) {
-                $this->read_buffer['payload'] .= $payload;
-                $this->read_buffer['frames']++;
-            }
-        } while (!$final);
+        // Subsequent continuation frames, add to buffer
+        if ($continuation) {
+            $this->read_buffer['payload'] .= $payload;
+            $this->read_buffer['frames']++;
+        }
+
+        if (!$final) {
+        	return null;
+        }
+
+        $this->nonblocking_read_buffer = '';
 
         // Final, return payload
         $frames = 1;
@@ -281,113 +290,119 @@ class Base implements LoggerAwareInterface
             : $payload;
     }
 
-    protected function receiveFragment(): array
+    protected function receiveFragment(): ?array
     {
-        // Read the fragment "header" first, two bytes.
-        $data = $this->read(2);
-        list ($byte_1, $byte_2) = array_values(unpack('C*', $data));
+    	try {
+		    $offset = 0;
+		    $data = $this->readNonBlocking(2, $offset);
 
-        $final = (bool)($byte_1 & 0b10000000); // Final fragment marker.
-        $rsv = $byte_1 & 0b01110000; // Unused bits, ignore
+		    list ($byte_1, $byte_2) = array_values(unpack('C*', $data));
 
-        // Parse opcode
-        $opcode_int = $byte_1 & 0b00001111;
-        $opcode_ints = array_flip(self::$opcodes);
-        if (!array_key_exists($opcode_int, $opcode_ints)) {
-            $warning = "Bad opcode in websocket frame: {$opcode_int}";
-            $this->logger->warning($warning);
-            throw new ConnectionException($warning, ConnectionException::BAD_OPCODE);
-        }
-        $opcode = $opcode_ints[$opcode_int];
+		    $final = (bool)($byte_1 & 0b10000000); // Final fragment marker.
+		    $rsv = $byte_1 & 0b01110000; // Unused bits, ignore
 
-        // Masking bit
-        $mask = (bool)($byte_2 & 0b10000000);
+		    // Parse opcode
+		    $opcode_int = $byte_1 & 0b00001111;
+		    $opcode_ints = array_flip(self::$opcodes);
+		    if (!array_key_exists($opcode_int, $opcode_ints)) {
+			    $warning = "Bad opcode in websocket frame: {$opcode_int}";
+			    $this->logger->warning($warning);
+			    throw new ConnectionException($warning, ConnectionException::BAD_OPCODE);
+		    }
+		    $opcode = $opcode_ints[$opcode_int];
 
-        $payload = '';
+		    // Masking bit
+		    $mask = (bool)($byte_2 & 0b10000000);
 
-        // Payload length
-        $payload_length = $byte_2 & 0b01111111;
+		    $payload = '';
 
-        if ($payload_length > 125) {
-            if ($payload_length === 126) {
-                $data = $this->read(2); // 126: Payload is a 16-bit unsigned int
-                $payload_length = current(unpack('n', $data));
-            } else {
-                $data = $this->read(8); // 127: Payload is a 64-bit unsigned int
-                $payload_length = current(unpack('J', $data));
-            }
-        }
+		    // Payload length
+		    $payload_length = $byte_2 & 0b01111111;
 
-        // Get masking key.
-        if ($mask) {
-            $masking_key = $this->read(4);
-        }
+		    if ($payload_length > 125) {
+			    if ($payload_length === 126) {
+				    $data = $this->readNonBlocking(2, $offset); // 126: Payload is a 16-bit unsigned int
+				    $payload_length = current(unpack('n', $data));
+			    } else {
+				    $data = $this->readNonBlocking(8, $offset); // 127: Payload is a 64-bit unsigned int
+				    $payload_length = current(unpack('J', $data));
+			    }
+		    }
 
-        // Get the actual payload, if any (might not be for e.g. close frames.
-        if ($payload_length > 0) {
-            $data = $this->read($payload_length);
+		    // Get masking key.
+		    if ($mask) {
+			    $masking_key = $this->readNonBlocking(4, $offset);
+		    }
 
-            if ($mask) {
-                // Unmask payload.
-                for ($i = 0; $i < $payload_length; $i++) {
-                    $payload .= ($data[$i] ^ $masking_key[$i % 4]);
-                }
-            } else {
-                $payload = $data;
-            }
-        }
+		    // Get the actual payload, if any (might not be for e.g. close frames.
+		    if ($payload_length > 0) {
+			    $data = $this->readNonBlocking($payload_length, $offset);
 
-        $this->logger->debug("Read '{opcode}' frame", [
-            'opcode' => $opcode,
-            'final' => $final,
-            'content-length' => strlen($payload),
-        ]);
+			    if ($mask) {
+				    // Unmask payload.
+				    for ($i = 0; $i < $payload_length; $i++) {
+					    $payload .= ($data[$i] ^ $masking_key[$i % 4]);
+				    }
+			    } else {
+				    $payload = $data;
+			    }
+		    }
 
-        // if we received a ping, send a pong and wait for the next message
-        if ($opcode === 'ping') {
-            $this->logger->debug("Received 'ping', sending 'pong'.");
-            $this->send($payload, 'pong', true);
-            return [$payload, true, $opcode];
-        }
+		    $this->logger->debug("Read '{opcode}' frame", [
+			    'opcode' => $opcode,
+			    'final' => $final,
+			    'content-length' => strlen($payload),
+		    ]);
 
-        // if we received a pong, wait for the next message
-        if ($opcode === 'pong') {
-            $this->logger->debug("Received 'pong'.");
-            return [$payload, true, $opcode];
-        }
+		    // if we received a ping, send a pong and wait for the next message
+		    if ($opcode === 'ping') {
+			    $this->logger->debug("Received 'ping', sending 'pong'.");
+			    $this->send($payload, 'pong', true);
+			    return [$payload, true, $opcode];
+		    }
 
-        if ($opcode === 'close') {
-            $status_bin = '';
-            $status = '';
-            // Get the close status.
-            $status_bin = '';
-            $status = '';
-            if ($payload_length > 0) {
-                $status_bin = $payload[0] . $payload[1];
-                $status = current(unpack('n', $payload));
-                $this->close_status = $status;
-            }
-            // Get additional close message
-            if ($payload_length >= 2) {
-                $payload = substr($payload, 2);
-            }
+		    // if we received a pong, wait for the next message
+		    if ($opcode === 'pong') {
+			    $this->logger->debug("Received 'pong'.");
+			    return [$payload, true, $opcode];
+		    }
 
-            $this->logger->debug("Received 'close', status: {$this->close_status}.");
+		    if ($opcode === 'close') {
+			    $status_bin = '';
+			    $status = '';
+			    // Get the close status.
+			    $status_bin = '';
+			    $status = '';
+			    if ($payload_length > 0) {
+				    $status_bin = $payload[0] . $payload[1];
+				    $status = current(unpack('n', $payload));
+				    $this->close_status = $status;
+			    }
+			    // Get additional close message
+			    if ($payload_length >= 2) {
+				    $payload = substr($payload, 2);
+				    $this->close_status_string = $payload;
+			    }
 
-            if ($this->is_closing) {
-                $this->is_closing = false; // A close response, all done.
-            } else {
-                $this->send($status_bin . 'Close acknowledged: ' . $status, 'close', true); // Respond.
-            }
+			    $this->logger->debug("Received 'close', status: {$this->close_status}.");
 
-            // Close the socket.
-            fclose($this->socket);
+			    if ($this->is_closing) {
+				    $this->is_closing = false; // A close response, all done.
+			    } else {
+				    $this->send($status_bin . 'Close acknowledged: ' . $status, 'close', true); // Respond.
+			    }
 
-            // Closing should not return message.
-            return [$payload, true, $opcode];
-        }
+			    // Close the socket.
+			    fclose($this->socket);
 
-        return [$payload, $final, $opcode];
+			    // Closing should not return message.
+			    return [$payload, true, $opcode];
+		    }
+
+		    return [$payload, $final, $opcode];
+	    } catch (NoDataAvailableException $ex) {
+    		return null;
+	    }
     }
 
     /**
@@ -463,6 +478,27 @@ class Base implements LoggerAwareInterface
             $this->logger->debug("Read {$read} of {$length} bytes.");
         }
         return $data;
+    }
+
+    protected function readNonBlocking(int $length, int &$offset): string {
+    	if (strlen($this->nonblocking_read_buffer) >= $offset + $length) {
+    		$buffer = substr($this->nonblocking_read_buffer, $offset, $length);
+		    $offset += $length;
+		    return $buffer;
+	    }
+
+    	stream_set_blocking($this->socket, false);
+    	$buffer = @fread($this->socket, $length);
+    	stream_set_blocking($this->socket, true);
+
+    	if (!$buffer) {
+    		$this->logger->debug("Read nothing of $length bytes");
+    		throw new NoDataAvailableException();
+	    }
+
+    	$this->nonblocking_read_buffer .= $buffer;
+    	$offset += $length;
+    	return $buffer;
     }
 
     protected function throwException(string $message, int $code = 0): void
