@@ -490,6 +490,12 @@ class Base implements LoggerAwareInterface
     	$buffer = @fread($this->socket, $length);
     	stream_set_blocking($this->socket, true);
 
+    	if ($buffer && strlen($buffer) < $length) {
+    		$this->logger->debug("Read too few bytes (got " . strlen($buffer) . ", expected $length)");
+    		$this->nonblocking_read_buffer .= $buffer;
+    		throw new NoDataAvailableException();
+	    }
+
     	if (!$buffer) {
     		$this->logger->debug("Read nothing of $length bytes");
     		throw new NoDataAvailableException();
