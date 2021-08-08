@@ -425,7 +425,6 @@ class Base implements LoggerAwareInterface
         $this->logger->debug("Closing with status: {$status_str}.");
 
         $this->is_closing = true;
-        $this->receive(); // Receiving a close frame will close the socket now.
     }
 
     /**
