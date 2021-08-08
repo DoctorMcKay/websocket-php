@@ -97,36 +97,18 @@ class Client extends Base
                 throw new \InvalidArgumentException($error);
             }
         } else {
-            $context = stream_context_create();
+            $context = stream_context_create([
+            	'ssl' => [
+            		'peer_name' => $host
+	            ]
+            ]);
         }
 
         $persistent = $this->options['persistent'] === true;
         $flags = STREAM_CLIENT_CONNECT;
         $flags = $persistent ? $flags | STREAM_CLIENT_PERSISTENT : $flags;
 
-        $error = $errno = $errstr = null;
-        set_error_handler(function (int $severity, string $message, string $file, int $line) use (&$error) {
-            $this->logger->warning($message, ['severity' => $severity]);
-            $error = $message;
-        }, E_ALL);
-
-        // Open the socket.
-        $this->socket = stream_socket_client(
-            "{$host_uri}:{$port}",
-            $errno,
-            $errstr,
-            $this->options['timeout'],
-            $flags,
-            $context
-        );
-
-        restore_error_handler();
-
-        if (!$this->isConnected()) {
-            $error = "Could not open socket to \"{$host}:{$port}\": {$errstr} ({$errno}) {$error}.";
-            $this->logger->error($error);
-            throw new ConnectionException($error);
-        }
+        $this->openSocket($host_uri, $host, $port, $flags, $context);
 
         $address = "{$scheme}://{$host}{$path_with_query}";
 
@@ -198,6 +180,60 @@ class Client extends Base
         }
 
         $this->logger->info("Client connected to {$address}");
+    }
+
+    protected function openSocket($host_uri, $host, $port, $flags, $context)
+    {
+	    $error = $errno = $errstr = null;
+	    set_error_handler(function (int $severity, string $message, string $file, int $line) use (&$error) {
+		    $this->logger->warning($message, ['severity' => $severity]);
+		    $error = $message;
+	    }, E_ALL);
+
+	    $proxy = $this->options['proxy'] ?? null;
+
+	    // Open the socket.
+	    $this->socket = stream_socket_client(
+		    $proxy ?: "{$host_uri}:{$port}",
+		    $errno,
+		    $errstr,
+		    $this->options['timeout'],
+		    $flags,
+		    $context
+	    );
+
+	    restore_error_handler();
+
+	    if (!$this->isConnected()) {
+		    $error = "Could not open socket to \"{$host}:{$port}\": {$errstr} ({$errno}) {$error}.";
+		    $this->logger->error($error);
+		    throw new ConnectionException($error);
+	    }
+
+	    if ($proxy) {
+		    fwrite($this->socket, "CONNECT $host:$port HTTP/1.1\r\n\r\n");
+
+		    // We don't want to accidentally read too much, so read 1 byte at a time
+		    $proxyResponseBuffer = '';
+		    while (true) {
+			    $proxyResponseBuffer .= fread($this->socket, 1);
+			    if (substr($proxyResponseBuffer, strlen($proxyResponseBuffer) - 4) == "\r\n\r\n") {
+				    break;
+			    }
+		    }
+
+		    $proxyResponseCode = substr($proxyResponseBuffer, 9, 3);
+		    if ($proxyResponseCode != 200) {
+			    fclose($this->socket);
+			    $error = "Could not open socket to \"$host:$port\": Proxy error $proxyResponseCode";
+			    $this->logger->error($error);
+		    	throw new ConnectionException($error);
+		    }
+
+		    if (strpos($host_uri, 'ssl://') === 0) {
+		    	stream_socket_enable_crypto($this->socket, true, STREAM_CRYPTO_METHOD_ANY_CLIENT);
+		    }
+	    }
     }
 
     /**
